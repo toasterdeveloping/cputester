@@ -3,7 +3,7 @@
 pkgname=cputester
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Terminal-based CPU emulator for testing CPU instructions and performance."
+pkgdesc="Terminal-based CPU emulator for testing CPU instructions."
 arch=('any')
 url="https://github.com/toasterdeveloping/cputester"
 license=('MIT')
