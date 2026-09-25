@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import logging
+import traceback
+import time
+
+HALT = 0x00
+LOAD = 0x01
+ADD = 0x02
+SUB = 0x03
+PRINT = 0x04
+
+YELLOW = "\033[93m"
+RESET = "\033[0m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+
+HELP_TEXT = """cputester - A CPU emulator
+
+USAGE:
+    cputester [FLAGS] <file.bin>
+
+FLAGS:
+    -h, --help      Display this help menu
+    -v, --version   Show program version information
+    --no-pause      Run without waiting between instructions
+    --step          Wait for Enter between instructions
+    --quiet         Reduce terminal output
+"""
+
+VERSION = "1.0.0"
+
+
+def create_logger(binary_path):
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    binary_name = os.path.basename(binary_path)
+    log_path = os.path.join(log_dir, binary_name + ".log")
+
+    logger = logging.getLogger(binary_path)
+    logger.setLevel(logging.DEBUG)
+
+    if not logger.handlers:
+        handler = logging.FileHandler(log_path)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s"
+            )
+        )
+        logger.addHandler(handler)
+
+    return logger, log_path
+
+
+def fatal_error(logger, code, message, cpu=None):
+    print(f"{RED}Error [{code}]: {message}{RESET}")
+    logger.error("[%s] %s", code, message)
+
+    if cpu:
+        logger.error("PC: %d", cpu.pc)
+        logger.error("Registers: %s", cpu.registers)
+        logger.error("Memory around PC: %s", cpu.memory[cpu.pc:cpu.pc + 16])
+
+    print(f"Log file: {logger.handlers[0].baseFilename}")
+    sys.exit(1)
+
+
+def warning(logger, message, cpu=None):
+    print(f"{YELLOW}Warning: {message}{RESET}")
+    logger.warning(message)
+
+    if cpu:
+        logger.warning("PC: %d", cpu.pc)
+        logger.warning("Registers: %s", cpu.registers)
+
+
+class VirtualCPU:
+    def __init__(self, logger, pause=False, quiet=False):
+        self.registers = [0] * 4
+        self.pc = 0
+        self.memory = [0] * 256
+        self.running = True
+        self.logger = logger
+        self.pause = pause
+        self.quiet = quiet
+        self.instructions_executed = 0
+
+    def load_program(self, binary_data):
+        if len(binary_data) > 256:
+            fatal_error(
+                self.logger,
+                "E004",
+                f"Program is too large ({len(binary_data)} bytes, maximum is 256).",
+                self
+            )
+
+        if len(binary_data) == 0:
+            fatal_error(
+                self.logger,
+                "E005",
+                "Program is empty.",
+                self
+            )
+
+        for i, byte in enumerate(binary_data):
+            self.memory[i] = byte
+
+        self.logger.info("Loaded program: %d bytes", len(binary_data))
+
+        if len(binary_data) >= 240:
+            warning(
+                self.logger,
+                "Program is using almost all available memory.",
+                self
+            )
+
+    def check_instruction_bounds(self, size):
+        if self.pc + size > len(self.memory):
+            fatal_error(
+                self.logger,
+                "E007",
+                f"Instruction at PC {self.pc} extends beyond memory.",
+                self
+            )
+
+    def check_register(self, register):
+        if register < 0 or register > 3:
+            fatal_error(
+                self.logger,
+                "E008",
+                f"Invalid register R{register}. Valid registers are R0-R3.",
+                self
+            )
+
+    def print_system_state(self, instruction, current_pc):
+        if self.quiet:
+            return
+
+        print()
+        print("=" * 60)
+        print(
+            f"{CYAN}FETCH / EXECUTE: {instruction} "
+            f"(PC: {current_pc}){RESET}"
+        )
+        print(
+            "Registers: " +
+            " | ".join(
+                f"R{i}:0x{value:02X}"
+                for i, value in enumerate(self.registers)
+            )
+        )
+        print("-" * 60)
+
+        start = max(0, current_pc)
+        end = min(16, len(self.memory))
+
+        bytes_display = " ".join(
+            f"{self.memory[i]:02X}"
+            for i in range(start, end)
+        )
+
+        print(f"[{start:02X}]: {bytes_display}")
+
+    def fetch(self):
+        self.check_instruction_bounds(1)
+
+        opcode = self.memory[self.pc]
+
+        self.logger.debug(
+            "FETCH PC=%d OPCODE=0x%02X",
+            self.pc,
+            opcode
+        )
+
+        return opcode
+
+    def decode(self, opcode):
+        names = {
+            HALT: "HALT",
+            LOAD: "LOAD",
+            ADD: "ADD",
+            SUB: "SUB",
+            PRINT: "PRINT"
+        }
+
+        if opcode not in names:
+            fatal_error(
+                self.logger,
+                "E006",
+                f"Unknown opcode 0x{opcode:02X} at PC {self.pc}.",
+                self
+            )
+
+        return names[opcode]
+
+    def execute(self, opcode, current_pc):
+        if opcode == HALT:
+            self.check_instruction_bounds(1)
+
+            self.print_system_state("HALT", current_pc)
+
+            self.logger.info("HALT at PC %d", current_pc)
+
+            self.running = False
+            self.pc += 1
+
+        elif opcode == LOAD:
+            self.check_instruction_bounds(3)
+
+            register = self.memory[self.pc + 1]
+            value = self.memory[self.pc + 2]
+
+            self.check_register(register)
+
+            self.registers[register] = value
+
+            instruction = f"LOAD R{register}, {value}"
+
+            self.print_system_state(instruction, current_pc)
+
+            self.logger.info(
+                "LOAD R%d <- %d",
+                register,
+                value
+            )
+
+            self.pc += 3
+
+        elif opcode == ADD:
+            self.check_instruction_bounds(4)
+
+            destination = self.memory[self.pc + 1]
+            source_a = self.memory[self.pc + 2]
+            source_b = self.memory[self.pc + 3]
+
+            self.check_register(destination)
+            self.check_register(source_a)
+            self.check_register(source_b)
+
+            result = (
+                self.registers[source_a] +
+                self.registers[source_b]
+            ) & 0xFF
+
+            self.registers[destination] = result
+
+            instruction = (
+                f"ADD R{destination}, "
+                f"R{source_a}, R{source_b}"
+            )
+
+            self.print_system_state(instruction, current_pc)
+
+            self.logger.info(
+                "ADD R%d <- R%d + R%d = %d",
+                destination,
+                source_a,
+                source_b,
+                result
+            )
+
+            self.pc += 4
+
+        elif opcode == SUB:
+            self.check_instruction_bounds(4)
+
+            destination = self.memory[self.pc + 1]
+            source_a = self.memory[self.pc + 2]
+            source_b = self.memory[self.pc + 3]
+
+            self.check_register(destination)
+            self.check_register(source_a)
+            self.check_register(source_b)
+
+            result = (
+                self.registers[source_a] -
+                self.registers[source_b]
+            ) & 0xFF
+
+            self.registers[destination] = result
+
+            instruction = (
+                f"SUB R{destination}, "
+                f"R{source_a}, R{source_b}"
+            )
+
+            self.print_system_state(instruction, current_pc)
+
+            self.logger.info(
+                "SUB R%d <- R%d - R%d = %d",
+                destination,
+                source_a,
+                source_b,
+                result
+            )
+
+            self.pc += 4
+
+        elif opcode == PRINT:
+            self.check_instruction_bounds(2)
+
+            register = self.memory[self.pc + 1]
+
+            self.check_register(register)
+
+            value = self.registers[register]
+
+            instruction = f"PRINT R{register}"
+
+            self.print_system_state(instruction, current_pc)
+
+            if not self.quiet:
+                print(f"\nCONSOLE OUTPUT = {value}")
+
+            self.logger.info(
+                "PRINT R%d = %d",
+                register,
+                value
+            )
+
+            self.pc += 2
+
+        self.instructions_executed += 1
+
+    def run(self):
+        self.logger.info("CPU started")
+
+        if not self.quiet:
+            print()
+            print("=" * 60)
+            print("SYSTEM BOOT")
+            print("=" * 60)
+            print("PC: 0")
+            print(
+                "Registers: " +
+                " | ".join(
+                    f"R{i}:0x{value:02X}"
+                    for i, value in enumerate(self.registers)
+                )
+            )
+
+        while self.running:
+            current_pc = self.pc
+
+            opcode = self.fetch()
+            instruction_name = self.decode(opcode)
+
+            self.logger.debug(
+                "DECODE PC=%d INSTRUCTION=%s",
+                current_pc,
+                instruction_name
+            )
+
+            self.execute(opcode, current_pc)
+
+            if self.running:
+                if self.pause:
+                    try:
+                        input("\nPress Enter for next step...")
+                    except KeyboardInterrupt:
+                        warning(
+                            self.logger,
+                            "Execution interrupted by user.",
+                            self
+                        )
+                        self.running = False
+                        break
+                elif not self.quiet:
+                    time.sleep(0.35)
+
+        if not self.quiet:
+            print()
+            print("=" * 60)
+            print("Processor halted.")
+            print(
+                f"Instructions executed: "
+                f"{self.instructions_executed}"
+            )
+            print("=" * 60)
+
+        self.logger.info(
+            "CPU halted after %d instructions",
+            self.instructions_executed
+        )
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or "-h" in args or "--help" in args:
+        print(HELP_TEXT)
+        return
+
+    if "-v" in args or "--version" in args:
+        print(f"cputester {VERSION}")
+        return
+
+    pause = "--step" in args
+    quiet = "--quiet" in args
+
+    args = [
+        arg for arg in args
+        if arg not in ("--step", "--no-pause", "--quiet")
+    ]
+
+    if len(args) == 0:
+        print(f"{RED}Error [E009]: No program file specified.{RESET}")
+        sys.exit(1)
+
+    if len(args) > 1:
+        print(f"{RED}Error [E009]: Multiple program files specified.{RESET}")
+        sys.exit(1)
+
+    binary_path = args[0]
+
+    logger, log_path = create_logger(binary_path)
+
+    print(f"Log file: {log_path}")
+
+    if not os.path.exists(binary_path):
+        fatal_error(
+            logger,
+            "E001",
+            f"File not found: {binary_path}"
+        )
+
+    try:
+        with open(binary_path, "rb") as file:
+            binary_data = file.read()
+
+    except PermissionError:
+        fatal_error(
+            logger,
+            "E003",
+            f"Permission denied: {binary_path}"
+        )
+
+    except OSError as error:
+        fatal_error(
+            logger,
+            "E002",
+            f"Could not read file: {error}"
+        )
+
+    cpu = VirtualCPU(
+        logger=logger,
+        pause=pause,
+        quiet=quiet
+    )
+
+    try:
+        cpu.load_program(binary_data)
+        cpu.run()
+
+    except KeyboardInterrupt:
+        warning(
+            logger,
+            "Execution interrupted by user.",
+            cpu
+        )
+
+    except Exception as error:
+        logger.error(
+            "Unexpected internal error: %s",
+            error
+        )
+        logger.error(traceback.format_exc())
+
+        print(
+            f"{RED}Error [E010]: "
+            f"An unexpected internal error occurred.{RESET}"
+        )
+        print(f"Log file: {log_path}")
+
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
