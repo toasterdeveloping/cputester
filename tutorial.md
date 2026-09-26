@@ -1,5 +1,5 @@
 # how to use
-since the package might be available on the AUR (Arch User Repository) i'll recommend you first install it
+since the package might be available on the AUR (Arch User Repository) i'll recommend you first install it (Note: yeah its not available on the AUR wait soon, for now just clone this repository and use ``makepkg -si``)
 
 # help command
 since its a terminal based tool, if you use ``cputester -h`` it will give you a list of commands flags to use
